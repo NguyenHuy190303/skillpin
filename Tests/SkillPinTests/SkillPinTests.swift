@@ -306,7 +306,7 @@ struct SkillCatalogTests {
         let pins = SkillCatalog(roots: roots).discover().flatMap(\.pins)
 
         #expect(roots.count == 2)
-        #expect(Set(roots.compactMap(\.project)) == [repo.lastPathComponent])
+        #expect(Set(roots.compactMap(\.project)) == [repo.standardizedFileURL.path])
         #expect(Set(pins.compactMap(\.project)).count == 1, "both pins name the same project")
         #expect(pins.map(\.label).sorted() == [repo.lastPathComponent, "\(repo.lastPathComponent): Claude"], "labels still tell the formats apart")
     }
