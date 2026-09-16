@@ -44,6 +44,8 @@ enum SkillPinner {
         provider: AgentProvider
     ) -> Result<PinPlan, PinError> {
         guard provider == .globals || provider.hasFlatLayout else { return .failure(.notFlat(provider)) }
+        guard AgentInventory.safeComponent(skillName) else { return .failure(.noSource) }
+        guard pins.allSatisfy({ $0.plugin == nil && !$0.isSystem }) else { return .failure(.noSource) }
         guard let source = source(from: pins) else { return .failure(.noSource) }
         let destination = destination(skillName: skillName, at: root, provider: provider)
         guard status(at: destination) == .absent else { return .failure(.alreadyInstalled(destination)) }

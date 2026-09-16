@@ -7,6 +7,7 @@ struct SkillRoot: Sendable {
     let isProject: Bool
     /// The repository this root belongs to. One project has one root per format.
     let project: String?
+    var plugin: PluginInstallation? = nil
     var isSystem = false
 
     init(label: String? = nil, url: URL, provider: AgentProvider, isProject: Bool = false, project: String? = nil) {
@@ -36,9 +37,11 @@ struct DiscoveredSkillPin: Identifiable, Sendable {
     /// The skill folder here is a symlink to a copy somewhere else.
     let isLink: Bool
     var project: String? = nil
+    var plugin: PluginInstallation? = nil
     var isSystem = false
 
     var scope: String { project.map { "Project: \($0)" } ?? (isSystem ? "System" : "User") }
+    var canArchive: Bool { !isProject && !isSystem && plugin == nil && provider.hasFlatLayout }
 }
 
 struct ScanIssue: Identifiable, Sendable {
@@ -124,10 +127,11 @@ struct SkillCatalog: Sendable {
                     isProject: root.isProject,
                     isLink: (try? folder.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) == true,
                     project: root.project,
+                    plugin: root.plugin,
                     isSystem: root.isSystem
                 )
                 // Only aliases of the same physical skill share a row. A name is not identity.
-                let key = [root.project ?? "user", root.isSystem ? "system" : "",
+                let key = [root.project ?? "user", root.isSystem ? "system" : "", root.plugin?.id ?? "",
                            fileURL.resolvingSymlinksInPath().path].joined(separator: "|")
                 if var existing = skills[key] {
                     if !existing.pins.contains(where: { $0.url == pin.url }) {
@@ -170,7 +174,7 @@ struct SkillCatalog: Sendable {
         func walk(_ directory: URL) {
             let real = directory.resolvingSymlinksInPath().path
             guard visited.insert(real).inserted else { return }   // symlink cycles
-            let allowed = roots.filter { $0.isProject == root.isProject && $0.project == root.project }
+            let allowed = roots.filter { $0.isProject == root.isProject && $0.project == root.project && $0.plugin?.id == root.plugin?.id }
             guard allowed.contains(where: {
                 directory.resolvingSymlinksInPath().isWithin($0.url.agentBoundary(provider: $0.provider))
             }) else {

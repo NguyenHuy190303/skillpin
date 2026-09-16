@@ -89,3 +89,97 @@ struct InventoryBoundaryTests {
     }
 }
 
+@Suite("Plugin registry and resources")
+struct PluginInventoryTests {
+    @Test("Claude uses the registry, preserves project scope, and ignores unregistered cache")
+    func claudeRegistry() throws {
+        let f = try InventoryFixture()
+        let user = f.home.appending(path: ".claude/plugins/cache/market/user/1")
+        let project = f.home.appending(path: ".claude/plugins/cache/market/project/1")
+        for name in ["user", "project", "orphan"] {
+            try f.write(".claude/plugins/cache/market/\(name)/1/.claude-plugin/plugin.json", "{\"name\":\"\(name)\"}")
+            try f.skill(".claude/plugins/cache/market/\(name)/1/skills/example")
+        }
+        try f.write(".claude/plugins/installed_plugins.json", """
+        {"version":2,"plugins":{
+          "user@market":[{"scope":"user","installPath":"\(user.path)","version":"1"}],
+          "project@market":[{"scope":"project","projectPath":"\(f.home.path)/repo","installPath":"\(project.path)","version":"1"}]
+        }}
+        """)
+        try f.write(".claude/settings.json", "{\"enabledPlugins\":{\"user@market\":false}}")
+        let inventory = AgentInventory.load(home: f.home, projects: [])
+        #expect(inventory.plugins.count == 1)
+        #expect(inventory.plugins[0].state == .disabled)
+        #expect(SkillCatalog(roots: inventory.roots).discover().count == 1)
+        let selected = AgentInventory.load(home: f.home, projects: [f.home.appending(path: "repo")])
+        #expect(selected.plugins.count == 2)
+        #expect(selected.roots.contains { $0.isProject && $0.plugin?.key == "project@market" })
+    }
+
+    @Test("Codex never guesses the active cached version")
+    func ambiguousCodex() throws {
+        let f = try InventoryFixture()
+        try f.write(".codex/config.toml", "[plugins.\"demo@market\"]\nenabled = true\n")
+        for version in ["1", "2"] {
+            try f.write(".codex/plugins/cache/market/demo/\(version)/.codex-plugin/plugin.json", "{\"name\":\"demo\",\"skills\":\"./custom\"}")
+            try f.skill(".codex/plugins/cache/market/demo/\(version)/custom/example")
+        }
+        let inventory = AgentInventory.load(home: f.home, projects: [])
+        #expect(inventory.plugins.count == 2)
+        #expect(inventory.plugins.allSatisfy { $0.state == .unknown })
+        #expect(inventory.issues.count == 1, "\(inventory.issues)")
+        #expect(SkillCatalog(roots: inventory.roots).discover().count == 2)
+    }
+
+    @Test("Rules and hooks are inventoried without executing hooks or reading project files by default")
+    func resources() throws {
+        let f = try InventoryFixture()
+        try f.write(".claude/rules/style.md", "Use short names.")
+        try f.write(".codex/rules/default.rules", "prefix_rule(pattern=[\"git\"], decision=\"allow\")")
+        try f.write(".claude/settings.json", "{\"hooks\":{\"SessionStart\":[{\"hooks\":[{\"type\":\"command\",\"command\":\"exit 99\"}]}]}}")
+        try f.write("repo/AGENTS.md", "Project instructions.")
+        try f.write("repo/Sources/Feature/AGENTS.override.md", "Nested instructions.")
+        try f.write("repo/node_modules/pkg/AGENTS.md", "Ignored dependency instructions.")
+        let inventory = AgentInventory.load(home: f.home, projects: [])
+        #expect(inventory.resources.filter { $0.kind == .rules }.count == 2)
+        #expect(inventory.resources.filter { $0.kind == .hooks }.count == 1)
+        #expect(!inventory.resources.contains { $0.detail.contains("exit 99") })
+        let selected = AgentInventory.load(home: f.home, projects: [f.home.appending(path: "repo")])
+        #expect(selected.resources.count == 5)
+        #expect(!selected.resources.contains { $0.url.path.contains("node_modules") })
+    }
+
+    @Test("Plugin manifests cannot import skills outside their installation")
+    func escapedManifest() throws {
+        let f = try InventoryFixture()
+        try f.write(".codex/config.toml", "[plugins.\"demo@market\"]\nenabled = true\n")
+        try f.write(".codex/plugins/cache/market/demo/1/.codex-plugin/plugin.json", "{\"skills\":\"../../../../../../repo\"}")
+        let inventory = AgentInventory.load(home: f.home, projects: [])
+        #expect(inventory.roots.isEmpty)
+        #expect(inventory.issues.contains { $0.message.contains("escapes") })
+    }
+}
+
+@Suite("Plugin controls")
+struct PluginControlTests {
+    @Test("Plugin switches preserve unrelated settings and reject ambiguous TOML")
+    func pluginSettings() throws {
+        let original = "# heading\n[plugins.\"demo@market\"]\nenabled = true # keep me\n[other]\nvalue = 42\n"
+        let updated = try PluginControl.replacingEnabled(in: original, key: "demo@market", enabled: false)
+        #expect(updated == original.replacingOccurrences(of: "enabled = true", with: "enabled = false"))
+        #expect(CodexPluginSettings.states(updated)["demo@market"] == .disabled)
+        #expect(throws: PluginControl.Failure.self) {
+            try PluginControl.replacingEnabled(in: original + "[plugins.\"demo@market\"]\nenabled = false\n", key: "demo@market", enabled: false)
+        }
+        #expect(CodexPluginSettings.states("value = '''\n" + original + "'''\n").isEmpty)
+
+        let f = try InventoryFixture()
+        let url = try f.write(".claude/settings.json", "{\"enabledPlugins\":{\"demo@market\":true},\"other\":{\"keep\":17}}")
+        let plugin = PluginInstallation(key: "demo@market", provider: .named("claude"), url: f.home, version: "1", project: nil, state: .enabled)
+        try PluginControl.setEnabled(false, plugin: plugin, home: f.home)
+        let settings = try #require(AgentInventory.json(url))
+        #expect((settings["other"] as? [String: Int])?["keep"] == 17)
+        #expect((settings["enabledPlugins"] as? [String: Bool])?["demo@market"] == false)
+        #expect(throws: PluginControl.Failure.self) { try PluginControl.setEnabled(false, plugin: plugin, home: f.home) }
+    }
+}
