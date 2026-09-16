@@ -183,3 +183,20 @@ struct PluginControlTests {
         #expect(throws: PluginControl.Failure.self) { try PluginControl.setEnabled(false, plugin: plugin, home: f.home) }
     }
 }
+@Suite("Context estimates")
+struct SkillContextTests {
+    @Test("Full instructions and optional supporting prose are separate; UTF-8 is counted explicitly")
+    func counts() throws {
+        let f = try InventoryFixture()
+        let folder = try f.skill(".agents/skills/example")
+        try f.write(".agents/skills/example/references/a.md", "abcdefgh")
+        try f.write(".agents/skills/example/scripts/a.py", "print('not automatically prompt text')")
+        let file = folder.appending(path: "SKILL.md")
+        let context = try #require(SkillContext.read(file: file, name: "same", description: "Example"))
+        #expect(context.supporting == 2)
+        #expect(context.resources.count == 2)
+        #expect(context.full == SkillContext.estimate(try String(contentsOf: file, encoding: .utf8)))
+        #expect(SkillContext.estimate("ế") == 1)
+        #expect(SkillContext.estimate("") == 0)
+    }
+}
