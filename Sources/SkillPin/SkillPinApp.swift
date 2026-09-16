@@ -6,7 +6,7 @@ struct SkillPinApp: App {
     var body: some Scene {
         MenuBarExtra("SkillPin", systemImage: "pin.fill") {
             SkillLibraryView()
-                .frame(width: 440, height: 620)
+                .frame(width: 560, height: 700)
         }
         .menuBarExtraStyle(.window)
     }
@@ -102,6 +102,15 @@ private struct SkillOriginGroup: Identifiable {
 }
 
 private struct SkillLibraryView: View {
+    @State private var section = "Skills"
+    @State private var inventory = AgentInventory()
+    @State private var scanIssues: [ScanIssue] = []
+    @State private var backups: [SkillBackup.Entry] = []
+    @State private var contextCounts: [String: Int] = [:]
+    @State private var sortByContext = false
+    @State private var loading = false
+    @State private var loadID = UUID()
+    @State private var actionMessage: String?
     @State private var search = ""
     @State private var filter: SkillFilter = .all
     @State private var visibleFilters = SkillFilter.primaryCases
@@ -115,21 +124,22 @@ private struct SkillLibraryView: View {
     @State private var projectPaths = UserDefaults.standard.stringArray(forKey: "projectPaths") ?? []
 
     private var filteredSkills: [Skill] {
-        skills.filter { skill in
+        let matching = skills.filter { skill in
             let matchesSearch = search.isEmpty ||
                 skill.name.localizedCaseInsensitiveContains(search) ||
                 skill.summary.localizedCaseInsensitiveContains(search)
             return matchesSearch && filter.includes(skill.discoveredPins)
         }
+        return sortByContext ? matching.sorted { contextCounts[$0.id, default: 0] > contextCounts[$1.id, default: 0] } : matching
     }
 
     /// One group per repository, whatever mix of formats it holds.
     private var projectGroups: [ProjectSkillGroup] {
-        let projects = Set(skills.flatMap(\.pins).compactMap(\.project))
+        let projects = Set(filteredSkills.flatMap(\.pins).compactMap(\.project))
         return projects.sorted { $0.localizedStandardCompare($1) == .orderedAscending }.map { project in
             ProjectSkillGroup(
                 id: project,
-                skills: skills.filter { $0.pins.contains { $0.project == project } }
+                skills: filteredSkills.filter { $0.pins.contains { $0.project == project } }
             )
         }
     }
@@ -147,9 +157,30 @@ private struct SkillLibraryView: View {
     var body: some View {
         VStack(spacing: 0) {
             header
-            searchField
-            filterBar
-            skillList
+            Picker("Library", selection: $section) {
+                ForEach(["Skills", "Plugins", "Rules", "Hooks", "Disabled", "Diagnostics"], id: \.self) { Text($0) }
+            }
+            .pickerStyle(.segmented)
+            .padding(.horizontal, 12)
+            .padding(.top, 8)
+            if section == "Skills" {
+                searchField
+                filterBar
+                HStack {
+                    Text("~\(filteredSkills.reduce(0) { $0 + SkillContext.estimate($1.name + "\n" + $1.summary + "\n" + $1.fileURL.path) }) discovery tokens · listed scope")
+                        .help(SkillContext.method + " This sums listed entries, including disabled plugins; it is not an active-session total.")
+                    Spacer()
+                    Toggle("Largest first", isOn: $sortByContext).toggleStyle(.checkbox)
+                }
+                .font(.system(size: 11)).foregroundStyle(.secondary).padding(.horizontal, 14)
+                skillList
+            } else {
+                InventoryPanel(section: section, inventory: inventory, issues: scanIssues, backups: backups,
+                    onRestore: restore, onPluginToggle: togglePlugin)
+            }
+            if let actionMessage {
+                Text(actionMessage).font(.system(size: 11)).textSelection(.enabled).padding(8)
+            }
             footer
         }
         .background(Color(nsColor: .windowBackgroundColor))
@@ -168,9 +199,9 @@ private struct SkillLibraryView: View {
                 .frame(width: 26, height: 26)
                 .background(Color(red: 0.80, green: 0.93, blue: 0.41), in: RoundedRectangle(cornerRadius: 7))
 
-            Text("Skills")
+            Text("SkillPin")
                 .font(.system(size: 14, weight: .semibold))
-            Text("\(skills.count) available")
+            Text(loading ? "Scanning…" : "\(skills.count) skills · \(inventory.plugins.count) plugins")
                 .font(.system(size: 12))
                 .foregroundStyle(.secondary)
             Spacer()
@@ -304,6 +335,7 @@ private struct SkillLibraryView: View {
                             onToggle: { root, isProject, provider in
                                 togglePin(at: root, isProject: isProject, provider: provider, of: skill)
                             },
+                            onArchive: { archive($0, of: skill) },
                             outcome: expandedSkill == skill.id ? lastOutcome : nil
                         )
                     }
@@ -390,6 +422,7 @@ private struct SkillLibraryView: View {
                         onToggle: { root, isProject, provider in
                             togglePin(at: root, isProject: isProject, provider: provider, of: skill)
                         },
+                        onArchive: { archive($0, of: skill) },
                         outcome: expandedSkill == skill.id ? lastOutcome : nil
                     )
                 }
@@ -415,7 +448,7 @@ private struct SkillLibraryView: View {
 
     private var footer: some View {
         HStack {
-            Text("Every pin is a copy. Copies that drift are marked.")
+            Text("Off keeps a backup. Context counts are estimates.")
             Spacer()
             Text("v\(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "dev")")
                 .monospacedDigit()
@@ -465,27 +498,10 @@ private struct SkillLibraryView: View {
         let outcome: PinOutcome
         do {
             if let existing {
-                if !existing.isLink {
-                    let dependents = SkillPinner.dependents(of: existing, among: skill.discoveredPins)
-                    let drifted = driftStates[existing.id] == .drifted
-                    switch confirmRemoval(of: [existing.url], links: 0, dependents: dependents, drifted: drifted) {
-                    case .cancel:
-                        return
-                    case .replace:
-                        guard let canonical = SkillDrift.canonical(among: skill.discoveredPins) else { return }
-                        try SkillDrift.update(existing, from: canonical)
-                        lastOutcome = .init(text: "Replaced \(existing.url.abbreviatedPath) from \(canonical.label)", isError: false)
-                        reloadSkills()
-                        return
-                    case .remove:
-                        break
-                    }
-                }
-                try SkillPinner.unpin(existing)
-                outcome = .init(text: "Removed \(existing.isLink ? "link" : "folder") \(existing.url.abbreviatedPath)", isError: false)
+                archive(existing, of: skill)
+                return
             } else if case .brokenLink = SkillPinner.status(at: flat) {
-                try SkillPinner.remove(at: flat)
-                outcome = .init(text: "Removed broken link \(flat.abbreviatedPath)", isError: false)
+                outcome = .init(text: "A broken link occupies \(flat.abbreviatedPath). Resolve it before pinning.", isError: true)
             } else {
                 let plan = try SkillPinner.plan(skillName: skill.name, pins: skill.discoveredPins, to: root, provider: provider).get()
                 try SkillPinner.perform(plan)
@@ -498,43 +514,63 @@ private struct SkillLibraryView: View {
         reloadSkills()
     }
 
-    private enum RemovalChoice { case remove, replace, cancel }
-
-    /// Deleting a real folder is the one destructive step, so it asks. A drifted
-    /// copy gets a third way out: take the canonical contents instead of deleting.
-    private func confirmRemoval(of folders: [URL], links: Int, dependents: [DiscoveredSkillPin], drifted: Bool) -> RemovalChoice {
-        let alert = NSAlert()
-        alert.messageText = folders.count == 1 ? "Delete this copy?" : "Delete these \(folders.count) copies?"
-        var detail = folders.map(\.abbreviatedPath).joined(separator: "\n")
-        if links > 0 { detail += "\n\nand \(links) link\(links == 1 ? "" : "s") to it here." }
-        if drifted { detail += "\n\nA copy here differs from the canonical one; those differences are lost." }
-        if !dependents.isEmpty {
-            detail += "\n\n\(dependents.count) link\(dependents.count == 1 ? "" : "s") elsewhere point here and would break: "
-                + dependents.map(\.label).joined(separator: ", ") + "."
-        }
-        alert.informativeText = detail
-        alert.alertStyle = .warning
-        alert.addButton(withTitle: "Delete")
-        alert.addButton(withTitle: "Cancel")
-        if drifted { alert.addButton(withTitle: "Replace with canonical") }
-        NSApp.activate(ignoringOtherApps: true)
-        switch alert.runModal() {
-        case .alertFirstButtonReturn: return .remove
-        case .alertThirdButtonReturn: return .replace
-        default: return .cancel
+    private func reloadSkills() {
+        let projects = projectPaths.map { URL(fileURLWithPath: $0) }
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let request = UUID()
+        loadID = request
+        loading = true
+        Task {
+            let result = await Task.detached(priority: .userInitiated) {
+                let inventory = AgentInventory.load(home: home, projects: projects)
+                let roots = SkillCatalog.userRoots(home: home) + projects.flatMap { ProjectSkillRoots.roots(for: $0) } + inventory.roots
+                let scan = SkillCatalog(roots: roots).scan()
+                let counts = Dictionary(uniqueKeysWithValues: scan.skills.map { skill in
+                    (skill.id, (try? String(contentsOf: skill.fileURL, encoding: .utf8)).map(SkillContext.estimate) ?? 0)
+                })
+                return (inventory, scan, counts, SkillBackup.default.entries(), SkillSources.default)
+            }.value
+            guard request == loadID else { return }
+            inventory = result.0
+            scanIssues = result.0.issues + result.1.issues
+            contextCounts = result.2
+            backups = result.3
+            skills = result.1.skills.map { Skill($0, sources: result.4) }
+            providers = Array(Set(result.1.skills.flatMap(\.pins).map(\.provider))).sorted { $0.key < $1.key }
+            if !providers.contains(.globals) { providers.insert(.globals, at: 0) }
+            reloadGeneration += 1
+            loading = false
         }
     }
 
-    private func reloadSkills() {
-        let projectRoots = projectPaths.flatMap {
-            ProjectSkillRoots.roots(for: URL(fileURLWithPath: $0))
-        }
-        let sources = SkillSources.default
-        providers = AgentProvider.discovered(in: FileManager.default.homeDirectoryForCurrentUser)
-        skills = SkillCatalog(roots: SkillCatalog.defaultRoots + projectRoots)
-            .discover()
-            .map { Skill($0, sources: sources) }
-        reloadGeneration += 1
+    private func archive(_ pin: DiscoveredSkillPin, of skill: Skill) {
+        do {
+            try SkillBackup.default.archive(pin, name: skill.name, allPins: skills.flatMap(\.discoveredPins))
+            actionMessage = "Off at \(pin.url.abbreviatedPath). Restore from Disabled. Existing sessions may need to reload."
+        } catch { actionMessage = error.localizedDescription }
+        reloadSkills()
+    }
+
+    private func restore(_ entry: SkillBackup.Entry) {
+        do {
+            try SkillBackup.default.restore(entry)
+            actionMessage = "Restored \(entry.name). Reload the agent if needed."
+        } catch { actionMessage = error.localizedDescription }
+        reloadSkills()
+    }
+
+    private func togglePlugin(_ plugin: PluginInstallation) {
+        let alert = NSAlert()
+        alert.messageText = "\(plugin.state == .enabled ? "Disable" : "Enable") \(plugin.key)?"
+        alert.informativeText = "This changes the whole plugin, including its skills, hooks and other components, in user settings. Reload the agent afterwards."
+        alert.addButton(withTitle: plugin.state == .enabled ? "Disable plugin" : "Enable plugin")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        do {
+            try PluginControl.setEnabled(plugin.state != .enabled, plugin: plugin, home: FileManager.default.homeDirectoryForCurrentUser)
+            actionMessage = "Plugin configuration saved. Reload the agent to apply it."
+        } catch { actionMessage = error.localizedDescription }
+        reloadSkills()
     }
 
     private func chooseProject() {
@@ -589,6 +625,7 @@ private struct SkillRow: View {
     let isExpanded: Bool
     let onTap: () -> Void
     let onToggle: (URL, Bool, AgentProvider) -> Void
+    let onArchive: (DiscoveredSkillPin) -> Void
     let outcome: PinOutcome?
 
     var body: some View {
@@ -607,12 +644,12 @@ private struct SkillRow: View {
                 .contentShape(Rectangle())
                 .onTapGesture(perform: onTap)
                 Spacer(minLength: 6)
-                PinMenu(
+                if skill.discoveredPins.allSatisfy({ $0.plugin == nil && !$0.isSystem }) { PinMenu(
                     skill: skill,
                     providers: providers,
                     projectPaths: projectPaths,
                     onToggle: onToggle
-                )
+                ) }
             }
 
             if !skill.pins.isEmpty {
@@ -626,6 +663,8 @@ private struct SkillRow: View {
             }
 
             if isExpanded {
+                SkillDetailsView(name: skill.name, summary: skill.summary, fileURL: skill.fileURL,
+                    pins: skill.discoveredPins, onArchive: onArchive)
                 SkillContentView(fileURL: skill.fileURL)
                     .padding(.top, 13)
                     .padding(.leading, 39)
