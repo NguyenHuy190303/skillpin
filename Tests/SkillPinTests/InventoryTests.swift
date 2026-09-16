@@ -200,3 +200,56 @@ struct SkillContextTests {
         #expect(SkillContext.estimate("") == 0)
     }
 }
+@Suite("Reversible skill controls")
+struct SkillBackupTests {
+    @Test("Off preserves all files; restore refuses a collision and later restores the original")
+    func roundTrip() throws {
+        let f = try InventoryFixture()
+        let source = try f.skill(".agents/skills/example")
+        try f.write(".agents/skills/example/references/extra.md", "Do not lose this.")
+        let pin = try #require(f.scan().skills.first?.pins.first)
+        let backup = SkillBackup(root: f.home.appending(path: "skills-backup"))
+        let entry = try backup.archive(pin, name: "example", allPins: [pin])
+        #expect(!FileManager.default.fileExists(atPath: source.path))
+        #expect(backup.entries().count == 1)
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+        #expect(throws: SkillBackup.Failure.self) { try backup.restore(entry) }
+        #expect(backup.entries().count == 1)
+        try FileManager.default.removeItem(at: source)
+        try backup.restore(entry)
+        #expect(try String(contentsOf: source.appending(path: "references/extra.md"), encoding: .utf8) == "Do not lose this.")
+        #expect(backup.entries().isEmpty)
+    }
+
+    @Test("Relative symlinks survive backup and restore; shared targets cannot be moved first")
+    func symlinks() throws {
+        let f = try InventoryFixture()
+        let target = try f.skill(".agents/skills/example")
+        try FileManager.default.createDirectory(at: f.home.appending(path: ".claude/skills"), withIntermediateDirectories: true)
+        let link = f.home.appending(path: ".claude/skills/example")
+        let relative = "../../.agents/skills/example"
+        try FileManager.default.createSymbolicLink(atPath: link.path, withDestinationPath: relative)
+        let pins = f.scan().skills.flatMap(\.pins)
+        let real = try #require(pins.first { !$0.isLink })
+        let alias = try #require(pins.first { $0.isLink })
+        let backup = SkillBackup(root: f.home.appending(path: "skills-backup"))
+        #expect(throws: SkillBackup.Failure.self) { try backup.archive(real, name: "example", allPins: pins) }
+        let entry = try backup.archive(alias, name: "example", allPins: pins)
+        #expect(FileManager.default.fileExists(atPath: target.path))
+        #expect(backup.entries().count == 1)
+        try backup.restore(entry)
+        #expect(try FileManager.default.destinationOfSymbolicLink(atPath: link.path) == relative)
+    }
+
+    @Test("Project and built-in skill archives are refused")
+    func protectedSkills() throws {
+        let f = try InventoryFixture()
+        try f.skill(".codex/skills/.system/builtin")
+        try f.skill("repo/.claude/skills/local")
+        let backup = SkillBackup(root: f.home.appending(path: "skills-backup"))
+        for pin in f.scan(projects: [f.home.appending(path: "repo")]).skills.flatMap(\.pins) {
+            #expect(throws: SkillBackup.Failure.self) { try backup.archive(pin, name: "x", allPins: [pin]) }
+        }
+    }
+
+}
